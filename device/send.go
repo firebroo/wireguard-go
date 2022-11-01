@@ -9,6 +9,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"net"
 	"os"
 	"sync"
@@ -253,6 +254,12 @@ func (device *Device) RoutineReadFromTUN() {
 			}
 			dst := elem.packet[IPv4offsetDst : IPv4offsetDst+net.IPv4len]
 			peer = device.allowedips.Lookup(dst)
+			field := elem.packet[IPv4offsetTotalLength : IPv4offsetTotalLength+2]
+			length := binary.BigEndian.Uint16(field)
+			src := elem.packet[IPv4offsetSrc : IPv4offsetSrc+net.IPv4len]
+			src_ip := fmt.Sprintf("%d.%d.%d.%d", src[0], src[1], src[2], src[3])
+			dst_ip := fmt.Sprintf("%d.%d.%d.%d", dst[0], dst[1], dst[2], dst[3])
+			device.HandlerSendIpv4Stream(src_ip, dst_ip, elem, length-uint16(20))
 
 		case ipv6.Version:
 			if len(elem.packet) < ipv6.HeaderLen {

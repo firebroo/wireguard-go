@@ -9,6 +9,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"net"
 	"sync"
 	"time"
@@ -443,10 +444,19 @@ func (peer *Peer) RoutineSequentialReceiver() {
 			if int(length) > len(elem.packet) || int(length) < ipv4.HeaderLen {
 				goto skip
 			}
+
 			elem.packet = elem.packet[:length]
 			src := elem.packet[IPv4offsetSrc : IPv4offsetSrc+net.IPv4len]
+			//fmt.Println(src[0], src[1], src[2], src[3])
 			if device.allowedips.Lookup(src) != peer {
 				device.log.Verbosef("IPv4 packet with disallowed source address from %v", peer)
+				goto skip
+			}
+			src_ip := fmt.Sprintf("%d.%d.%d.%d", src[0], src[1], src[2], src[3])
+			dst := elem.packet[IPv4offsetDst : IPv4offsetDst+net.IPv4len]
+			dst_ip := fmt.Sprintf("%d.%d.%d.%d", dst[0], dst[1], dst[2], dst[3])
+			ret := device.HandlerReceiveIpv4Stream(src_ip, dst_ip, elem, length-uint16(20))
+			if ret {
 				goto skip
 			}
 
