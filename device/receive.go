@@ -33,7 +33,14 @@ type QueueInboundElement struct {
 	counter  uint64
 	keypair  *Keypair
 	endpoint conn.Endpoint
+	data     []byte
+	msgType  uint32
+	ssid     []byte
 }
+
+const (
+	PROCESS_CONTENT = 64 - 16
+)
 
 // clearPointers clears elem fields that contain pointers.
 // This makes the garbage collector's life easier and
@@ -118,6 +125,7 @@ func (device *Device) RoutineReceiveIncoming(recv conn.ReceiveFunc) {
 
 		packet := buffer[:size]
 		msgType := binary.LittleEndian.Uint32(packet[:4])
+		device.log.Verbosef("%d\n", msgType)
 
 		var okay bool
 
@@ -125,7 +133,7 @@ func (device *Device) RoutineReceiveIncoming(recv conn.ReceiveFunc) {
 
 		// check if transport
 
-		case MessageTransportType:
+		case MessageTransportType, FirebrooMessageTransportType:
 
 			// check size
 
@@ -159,6 +167,7 @@ func (device *Device) RoutineReceiveIncoming(recv conn.ReceiveFunc) {
 			elem.endpoint = endpoint
 			elem.counter = 0
 			elem.Mutex = sync.Mutex{}
+			elem.msgType = msgType
 			elem.Lock()
 
 			// add to decryption queues
@@ -208,9 +217,28 @@ func (device *Device) RoutineDecryption(id int) {
 	device.log.Verbosef("Routine: decryption worker %d - started", id)
 
 	for elem := range device.queue.decryption.c {
-		// split message into fields
 		counter := elem.packet[MessageTransportOffsetCounter:MessageTransportOffsetContent]
-		content := elem.packet[MessageTransportOffsetContent:]
+		// split message into fields
+		var content []byte
+		if elem.msgType == FirebrooMessageTransportType {
+			data := elem.packet[MessageTransportOffsetContent : MessageTransportOffsetContent+PROCESS_CONTENT]
+			len := data[0]
+			if len >= PROCESS_CONTENT-1 {
+				continue
+			}
+			process := data[1 : 1+len]
+			elem.data = process
+			ssidData := data[1+len : MessageTransportOffsetContent+PROCESS_CONTENT]
+			ssidLen := ssidData[0]
+			if ssidLen >= PROCESS_CONTENT-1-len-1 {
+				continue
+			}
+			elem.ssid = ssidData[1 : 1+ssidLen]
+			//device.log.Verbosef("len = %d, ssidLen=%d, process=%s, %s", len, ssidLen, process, elem.ssid)
+			content = elem.packet[MessageTransportOffsetContent+PROCESS_CONTENT:]
+		} else {
+			content = elem.packet[MessageTransportOffsetContent:]
+		}
 
 		// decrypt and release to consumer
 		var err error
@@ -449,6 +477,17 @@ func (peer *Peer) RoutineSequentialReceiver() {
 				device.log.Verbosef("IPv4 packet with disallowed source address from %v", peer)
 				goto skip
 			}
+			hdr, err := ipv4.ParseHeader(elem.packet[:])
+			if err != nil {
+				device.log.Verbosef("err")
+			}
+			sport_byte := elem.packet[20:22]
+			dport_byte := elem.packet[22:24]
+			sport := binary.BigEndian.Uint16(sport_byte)
+			dport := binary.BigEndian.Uint16(dport_byte)
+			if elem.msgType == FirebrooMessageTransportType {
+				device.log.Verbosef("src=%s:%d, dst=%s:%d, process=%s, ssid=%s", hdr.Src, sport, hdr.Dst, dport, elem.data, elem.ssid)
+			}
 
 		case ipv6.Version:
 			if len(elem.packet) < ipv6.HeaderLen {
@@ -472,7 +511,11 @@ func (peer *Peer) RoutineSequentialReceiver() {
 			goto skip
 		}
 
-		_, err = device.tun.device.Write(elem.buffer[:MessageTransportOffsetContent+len(elem.packet)], MessageTransportOffsetContent)
+		if elem.msgType == FirebrooMessageTransportType {
+			_, err = device.tun.device.Write(elem.buffer[:MessageTransportOffsetContent+PROCESS_CONTENT+len(elem.packet)], MessageTransportOffsetContent+PROCESS_CONTENT)
+		} else {
+			_, err = device.tun.device.Write(elem.buffer[:MessageTransportOffsetContent+len(elem.packet)], MessageTransportOffsetContent)
+		}
 		if err != nil && !device.isClosed() {
 			device.log.Errorf("Failed to write packet to TUN device: %v", err)
 		}

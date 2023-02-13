@@ -9,8 +9,13 @@ import (
 	"bytes"
 	"encoding/binary"
 	"errors"
+	"fmt"
+	"io/ioutil"
 	"net"
 	"os"
+	"os/exec"
+	"regexp"
+	"strings"
 	"sync"
 	"time"
 
@@ -50,6 +55,36 @@ type QueueOutboundElement struct {
 	nonce   uint64                // nonce for encryption
 	keypair *Keypair              // keypair for encryption
 	peer    *Peer                 // related peer
+}
+
+var m sync.Map
+
+var ssid string
+
+func init() {
+	go func() {
+		for {
+			m.Range(func(k, v interface{}) bool {
+				key := k.(string)
+				process := handler_lsof(key)
+				if process == "" {
+					m.Delete(key)
+				} else {
+					m.Store(key, process)
+				}
+				return true
+			})
+			fmt.Printf("%v\n", m)
+			time.Sleep(2 * time.Second)
+		}
+	}()
+	go func() {
+		for {
+			ssid = handlerSSID()
+			fmt.Printf("%v\n", ssid)
+			time.Sleep(2 * time.Second)
+		}
+	}()
 }
 
 func (device *Device) NewOutboundElement() *QueueOutboundElement {
@@ -198,11 +233,73 @@ func (peer *Peer) keepKeyFreshSending() {
 	}
 }
 
+func getMacOSWifiSSID() string {
+	cmd := exec.Command("networksetup", "-getairportnetwork", "en0")
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return ""
+	}
+	defer stdout.Close()
+
+	if err := cmd.Start(); err != nil {
+		return ""
+	}
+	if opBytes, err := ioutil.ReadAll(stdout); err != nil {
+		return ""
+	} else {
+		return string(opBytes)
+	}
+}
+
+func handlerSSID() string {
+	data := getMacOSWifiSSID()
+	re := regexp.MustCompile("Current Wi-Fi Network: (?P<ssid>.*?)\n")
+	matches := re.FindStringSubmatch(data)
+	if len(matches) >= 2 {
+		return matches[1]
+	}
+	return ""
+}
+
+func lsof_cmd(addr string) string {
+	cmd := exec.Command("lsof", "+c", "0", "-n", "-i", addr)
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return ""
+	}
+	defer stdout.Close()
+
+	if err := cmd.Start(); err != nil {
+		return ""
+	}
+	if opBytes, err := ioutil.ReadAll(stdout); err != nil {
+		return ""
+	} else {
+		return string(opBytes)
+	}
+}
+
+func handler_lsof(addr string) string {
+	ret := lsof_cmd(addr)
+	t := strings.Split(ret, "\n")
+	for _, v := range t {
+		a := strings.Split(v, " ")
+		if a[0] == "COMMAND" {
+			continue
+		}
+		if a[0] != "" {
+			return a[0]
+		}
+	}
+	return ""
+}
+
 /* Reads packets from the TUN and inserts
  * into staged queue for peer
  *
  * Obs. Single instance per TUN device
  */
+
 func (device *Device) RoutineReadFromTUN() {
 	defer func() {
 		device.log.Verbosef("Routine: TUN reader - stopped")
@@ -359,6 +456,33 @@ func calculatePaddingSize(packetSize, mtu int) int {
 	return paddedSize - lastUnit
 }
 
+/*
+ * len data
+ */
+func makePrivateStruct(data []byte) []byte {
+	dataLen := len(data)
+	privateStruct := []byte{uint8(dataLen & 0xFF)}
+	privateStruct = append(privateStruct, data...)
+	return privateStruct
+}
+
+func udptcpPacketProcessStruct(elem *QueueOutboundElement, hdr *ipv4.Header) []byte {
+	sport_byte := elem.packet[TCPoffsetSrcPort : TCPoffsetSrcPort+2]
+	sport := binary.BigEndian.Uint16(sport_byte)
+	key := fmt.Sprintf("@%s:%d", hdr.Src, sport)
+
+	v, ok := m.Load(key)
+	var process string
+	if ok {
+		process = v.(string)
+	} else {
+		process = handler_lsof(key)
+		m.Store(key, process)
+	}
+	data := makePrivateStruct([]byte(process))
+	return data
+}
+
 /* Encrypts the elements in the queue
  * and marks them for sequential consumption (by releasing the mutex)
  *
@@ -379,7 +503,29 @@ func (device *Device) RoutineEncryption(id int) {
 		fieldReceiver := header[4:8]
 		fieldNonce := header[8:16]
 
-		binary.LittleEndian.PutUint32(fieldType, MessageTransportType)
+		if len(elem.packet) >= ipv4.HeaderLen {
+			hdr, err := ipv4.ParseHeader(elem.packet[:])
+			if err != nil {
+				device.log.Verbosef("err")
+			}
+			var processStruct []byte
+			switch hdr.Protocol {
+			case 0x01:
+				// 4 p i n g
+				processStruct = []byte{0x04, 0x70, 0x69, 0x6e, 0x67}
+			case 0x06, 0x11:
+				processStruct = udptcpPacketProcessStruct(elem, hdr)
+			default:
+				processStruct = []byte{0x00}
+			}
+			ssidStruct := makePrivateStruct([]byte(ssid))
+			processStruct = append(processStruct, ssidStruct...)
+			copy(header[16:MessageTransportHeaderSize], processStruct)
+		} else {
+			copy(header[16:MessageTransportHeaderSize], []byte{0x00, 0x00})
+		}
+
+		binary.LittleEndian.PutUint32(fieldType, FirebrooMessageTransportType)
 		binary.LittleEndian.PutUint32(fieldReceiver, elem.keypair.remoteIndex)
 		binary.LittleEndian.PutUint64(fieldNonce, elem.nonce)
 
@@ -436,6 +582,7 @@ func (peer *Peer) RoutineSequentialSender() {
 		// send message and return buffer to pool
 
 		err := peer.SendBuffer(elem.packet)
+
 		if len(elem.packet) != MessageKeepaliveSize {
 			peer.timersDataSent()
 		}

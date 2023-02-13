@@ -14,6 +14,10 @@ const (
 	IPv4offsetSrc         = 12
 	IPv4offsetDst         = IPv4offsetSrc + net.IPv4len
 )
+const (
+	TCPoffsetSrcPort = IPv4offsetDst + net.IPv4len
+	TCPoffsetDstPort = TCPoffsetSrcPort + 2
+)
 
 const (
 	IPv6offsetPayloadLength = 4
